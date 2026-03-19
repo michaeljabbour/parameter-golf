@@ -1,0 +1,8 @@
+# Parameter Golf Project Configuration
+# Amplifier Bundle Reference
+
+bundles:
+  - name: parameter-golf
+    source: git+https://github.com/michaeljabbour/amplifier-bundle-parameter-golf@main
+    description: Orchestration and analysis agents for the Parameter Golf challenge
+    default: true

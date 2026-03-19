@@ -1,0 +1,39 @@
+behavior:
+  name: parameter-golf
+  description: |
+    Core behavior for the Parameter Golf challenge orchestration bundle.
+    Registers all agents, mounts tools, and includes root context.
+    Orchestrates solving the OpenAI Parameter Golf challenge — achieving the
+    lowest possible val_bpb within the 16MB compressed artifact / 10-minute
+    training constraint on 8×H100 GPUs.
+
+tools:
+  - module: tool-filesystem
+    source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@v0.1.0
+  - module: tool-search
+    source: git+https://github.com/microsoft/amplifier-module-tool-search@v0.1.0
+  - module: tool-bash
+    source: git+https://github.com/microsoft/amplifier-module-tool-bash@v0.1.0
+  - module: tool-lsp
+    source: git+https://github.com/microsoft/amplifier-module-tool-lsp@v0.1.0
+  - module: tool-web
+    source: git+https://github.com/microsoft/amplifier-module-tool-web@v0.1.0
+
+agents:
+  include:
+    - agents/strategist.md
+    - agents/sweep-runner.md
+    - agents/result-analyst.md
+    - agents/code-optimizer.md
+    - agents/submission-packager.md
+
+context:
+  include:
+    - context/instructions.md
+
+hooks:
+  - module: hooks-mode
+    source: git+https://github.com/microsoft/amplifier-module-hooks-mode@v0.1.0
+    config:
+      search_paths:
+        - modes/

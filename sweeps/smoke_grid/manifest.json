@@ -1,0 +1,31 @@
+{
+  "sweep_id": "smoke_grid",
+  "created_at_unix": 1773893423.122048,
+  "grid": {
+    "num_unique_blocks": [
+      2,
+      4
+    ],
+    "block_share_strategy": [
+      "cycle"
+    ],
+    "qat_start_fraction": [
+      0.0,
+      0.8
+    ]
+  },
+  "base_args": {
+    "nproc_per_node": 1,
+    "num_layers": 4,
+    "model_dim": 64,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "mlp_mult": 2,
+    "train_batch_tokens": 256,
+    "train_seq_len": 32,
+    "iterations": 2,
+    "max_wallclock_seconds": 0.0,
+    "torch_compile": false
+  },
+  "extra_env": {}
+}

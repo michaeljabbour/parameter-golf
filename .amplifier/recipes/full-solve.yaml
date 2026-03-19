@@ -1,0 +1,242 @@
+name: full-solve
+description: |
+  End-to-end challenge solve with human approval gates at major decision points.
+  Stages: initial strategy → sweep rounds → code optimization → validation sweep → submission.
+
+  Approval gates fire at: between sweep rounds (human approves continuation or pivot),
+  before code changes (human reviews proposed modifications), and before PR submission
+  (human reviews the packaged artifacts).
+
+context:
+  target_bpb: "1.2194"      # Target val_bpb = current SOTA (1.2244) - 0.005 improvement bar
+  max_sweep_rounds: "5"      # Maximum rounds of sweep-cycle invocations
+  current_best_bpb: "1.2244" # Updated throughout — tracks the current best result
+  sweep_round: "0"           # Current sweep round counter
+  code_optimized: "false"    # Whether code-optimizer changes have been applied
+
+stages:
+  - name: initial-strategy
+    description: |
+      Analyze the baseline architecture and produce an initial experiment strategy.
+      No approval gate — this is a planning-only step.
+    steps:
+      - name: baseline-analysis
+        type: agent
+        agent: strategist
+        description: |
+          Analyze the baseline architecture and identify the most promising initial
+          experiment directions to pursue.
+        prompt: |
+          Begin the full-solve workflow. Analyze the baseline Parameter Golf architecture:
+          - val_bpb = 1.2244 (current SOTA, 10-min, 8×H100)
+          - Target: val_bpb ≤ {{ target_bpb }} (beats SOTA by ≥ 0.005)
+
+          Review the architecture-reference.md and experiment-tracking.md to:
+          1. Understand the current baseline architecture and all available knobs
+          2. Identify the 3 most promising directions for val_bpb improvement
+          3. Design the first sweep: 8–12 configs covering the highest-leverage parameters
+          4. Estimate: which direction has the highest expected impact?
+
+          Produce:
+          - initial_strategy: <prioritized list of 3 directions with rationale>
+          - first_sweep_plan: <sweep name, grid dimensions, expected impact>
+          - risk_factors: <what could prevent reaching the target>
+        output_key: initial_strategy
+
+  - name: sweep-rounds
+    description: |
+      Iterative sweep rounds with approval gates between each round. Each round
+      invokes the sweep-cycle sub-recipe. The human reviews progress after each
+      round and decides whether to continue, pivot, or stop.
+    approval_gate:
+      timing: after
+      message: |
+        All sweep rounds complete ({{ sweep_round }} of {{ max_sweep_rounds }} run).
+
+        Current best val_bpb: {{ current_best_bpb }}
+        Target val_bpb: {{ target_bpb }}
+        Gap to target: {{ (current_best_bpb | float) - (target_bpb | float) }}
+
+        Options:
+        - Approve "continue" → proceed to code optimization stage
+        - Approve "submit" → skip optimization, go straight to submission
+          (only if current_best_bpb ≤ target_bpb)
+        - Deny → stop the full-solve workflow
+    steps:
+      - name: sweep-round-loop
+        type: while
+        while_condition: "{{ sweep_round }} < {{ max_sweep_rounds }} and {{ current_best_bpb | float }} > {{ target_bpb | float }}"
+        break_when: "{{ current_best_bpb | float }} <= {{ target_bpb | float }}"
+        steps:
+          - name: run-sweep-cycle
+            type: recipe
+            recipe: parameter-golf:recipes/sweep-cycle.yaml
+            description: |
+              Invoke one complete sweep-cycle: strategize → configure → execute →
+              analyze → evaluate convergence.
+            context:
+              improvement_threshold: "0.003"
+              max_iterations: "3"
+              current_best_bpb: "{{ current_best_bpb }}"
+            output_key: sweep_cycle_result
+            update_context:
+              current_best_bpb: "{{ sweep_cycle_result.current_best_bpb }}"
+              sweep_round: "{{ sweep_round | int + 1 }}"
+
+  - name: code-optimization
+    description: |
+      Apply targeted code changes to train_gpt.py based on accumulated insights.
+      Approval gate BEFORE changes — human reviews the proposed modifications.
+    approval_gate:
+      timing: before
+      message: |
+        The sweep rounds are complete. Current best val_bpb: {{ current_best_bpb }}
+
+        The code-optimizer will now propose targeted changes to train_gpt.py to unlock
+        further improvement. The proposed changes will be shown to you before any code
+        is modified.
+
+        Approve to continue with code optimization, or deny to skip to submission.
+    steps:
+      - name: propose-changes
+        type: agent
+        agent: code-optimizer
+        description: |
+          Based on accumulated sweep results, identify and propose specific code changes
+          to train_gpt.py. Present a clear proposal before making any modifications.
+        prompt: |
+          Based on all sweep results accumulated so far (current best val_bpb: {{ current_best_bpb }}),
+          analyze what code changes to train_gpt.py could unlock further improvement.
+
+          First, produce a detailed proposal (do NOT make changes yet):
+          1. What specific mechanism is limiting further improvement?
+          2. What code change would address it?
+          3. What new env var(s) would be added to Hyperparameters?
+          4. What is the estimated impact on val_bpb?
+          5. What is the code-byte cost (lines added × UTF-8 bytes)?
+          6. How does this affect the artifact size budget?
+
+          Output your proposal clearly. The human will review before you proceed.
+        output_key: code_proposal
+
+      - name: implement-changes
+        type: agent
+        agent: code-optimizer
+        description: |
+          Implement the approved code changes to train_gpt.py surgically,
+          validate with a smoke test, and commit.
+        prompt: |
+          Implement the following approved code changes to train_gpt.py:
+
+          Proposal: {{ code_proposal }}
+
+          Steps:
+          1. Read the current train_gpt.py to understand the exact insertion points
+          2. Make the surgical change using edit_file
+          3. Run a smoke test:
+             ```bash
+             ITERATIONS=10 MAX_WALLCLOCK_SECONDS=60 torchrun --nproc_per_node=8 train_gpt.py
+             ```
+          4. Confirm the smoke test completes without error
+          5. Run python_check tool on train_gpt.py for code quality (ruff + pyright)
+          6. Delegate to foundation:git-ops to commit with a descriptive message
+
+          Output: git_commit_hash, files_changed, lines_added
+        output_key: code_changes
+        update_context:
+          code_optimized: "true"
+
+  - name: validation-sweep
+    description: |
+      Run one sweep-cycle with the optimized code to confirm the changes
+      actually improve val_bpb. No approval gate — this is automated validation.
+    steps:
+      - name: validate-improvements
+        type: recipe
+        recipe: parameter-golf:recipes/sweep-cycle.yaml
+        description: |
+          Run a focused sweep cycle with the optimized code to confirm the new
+          knobs deliver the expected val_bpb improvement.
+        context:
+          improvement_threshold: "0.002"
+          max_iterations: "2"
+          current_best_bpb: "{{ current_best_bpb }}"
+        output_key: validation_result
+        update_context:
+          current_best_bpb: "{{ validation_result.current_best_bpb }}"
+
+  - name: submission
+    description: |
+      Prepare the challenge submission and validate all constraints.
+      Approval gate BEFORE PR — human reviews the packaged artifacts.
+    approval_gate:
+      timing: before
+      message: |
+        Ready to submit!
+
+        Final val_bpb: {{ current_best_bpb }}
+        Target val_bpb: {{ target_bpb }}
+        Gap to SOTA: {{ (1.2244 | float) - (current_best_bpb | float) }} (must be ≥ 0.005)
+
+        The submission-packager will now create the records/ folder and open a PR.
+        Please review the summary above before approving.
+
+        Approve to proceed with submission, or deny to run more experiments.
+    steps:
+      - name: package-submission
+        type: agent
+        agent: submission-packager
+        description: |
+          Create the complete submission folder with all required files, validate
+          all challenge constraints, and open a PR.
+        prompt: |
+          Prepare the challenge submission for the winning configuration.
+
+          Final val_bpb: {{ current_best_bpb }}
+          Target val_bpb: {{ target_bpb }}
+          Code optimized: {{ code_optimized }}
+
+          Steps:
+          1. Identify the winning run_id and its exact git commit from the validation sweep
+          2. Create records/track_10min_16mb/<submission_name>/ folder
+          3. Copy the winning train_gpt.py (from the correct commit)
+          4. Copy the winning train.log
+          5. Generate submission.json with all metadata
+          6. Write a detailed README.md explaining the approach
+          7. Validate all constraints:
+             - artifact size < 16,000,000 bytes
+             - final_int8_zlib_roundtrip_exact = true
+             - wallclock ≤ 600 seconds
+          8. Delegate to foundation:git-ops to open the PR
+
+          If the secondary goal is requested: also export to HuggingFace format via
+          foundation:modular-builder.
+        output_key: submission_result
+
+      - name: final-summary
+        type: agent
+        agent: result-analyst
+        description: |
+          Produce a final summary of the full-solve run: what was achieved, how,
+          and what the submission contains.
+        prompt: |
+          Produce a final full-solve summary.
+
+          Starting val_bpb: 1.2244 (baseline SOTA)
+          Final val_bpb: {{ current_best_bpb }}
+          Sweep rounds completed: {{ sweep_round }}
+          Code optimized: {{ code_optimized }}
+          Submission: {{ submission_result }}
+
+          ## Full-Solve Summary
+
+          **Result:** val_bpb {{ current_best_bpb }} (improvement: {{ (1.2244 | float) - (current_best_bpb | float) }} nats)
+          **Sweep rounds:** {{ sweep_round }}
+          **Code changes:** {{ code_optimized }}
+
+          ### What We Found
+          <key architectural insight that drove the improvement>
+
+          ### Submission
+          <PR link and submission folder path>
+        output_key: full_solve_summary

@@ -1,0 +1,194 @@
+name: sweep-cycle
+description: |
+  Iterative convergence loop: strategize → configure → run sweep → analyze →
+  evaluate improvement → repeat. Continues until improvement drops below the
+  threshold or the maximum iteration count is reached.
+
+  Adapted from the attractor convergence pattern. Each iteration tightens the
+  search around the current best configuration.
+
+context:
+  improvement_threshold: "0.005"   # Minimum val_bpb improvement to continue (nats)
+  max_iterations: "10"             # Maximum sweep cycles before stopping
+  current_best_bpb: "1.2244"      # Updated each iteration — tracks best val_bpb seen
+  converged: "false"               # Set to true when improvement < threshold
+  sweep_history: ""                # Accumulates sweep names for cross-sweep analysis
+  iteration: "0"                   # Current iteration counter
+
+steps:
+  - name: sweep-loop
+    type: while
+    while_condition: "'{{ converged }}' == 'false' and {{ iteration }} < {{ max_iterations }}"
+    break_when: "'{{ converged }}' == 'true'"
+    steps:
+      - name: strategize
+        type: agent
+        agent: strategist
+        description: |
+          Analyze accumulated sweep results and design the next experiment
+          configuration set. On the first iteration, produce an initial plan
+          based on baseline architecture analysis.
+        prompt: |
+          Iteration {{ iteration }} of the sweep cycle.
+
+          Current best val_bpb: {{ current_best_bpb }}
+          Improvement threshold: {{ improvement_threshold }}
+          Sweeps completed so far: {{ sweep_history }}
+
+          {% if iteration == "0" %}
+          This is the first iteration. Analyze the baseline architecture (val_bpb = 1.2244)
+          using the architecture-reference.md to identify the most promising initial
+          experiment directions. Produce a sweep plan with 6–12 configurations covering
+          the highest-leverage parameter combinations.
+          {% else %}
+          Analyze the results from previous sweeps: {{ sweep_history }}
+          Identify patterns in what has worked and what hasn't. Design a focused
+          follow-up sweep that zooms in on the most promising parameter region.
+          Target 6–12 configurations. If improvement is slowing, consider whether
+          code changes (via code-optimizer) might unlock further gains.
+          {% endif %}
+
+          Output your sweep plan as:
+          - sweep_name: <descriptive name>
+          - grid dimensions: <list of env var name → values>
+          - rationale: <why these dimensions>
+          - expected_best_bpb: <your estimate of best achievable val_bpb>
+        output_key: strategy_plan
+
+      - name: configure
+        type: agent
+        agent: sweep-runner
+        description: |
+          Translate the strategy plan into a validated sweep script invocation.
+          Verify CLI arg syntax and estimate wallclock time before launching.
+        prompt: |
+          Translate this strategy plan into a sweep runner invocation:
+
+          {{ strategy_plan }}
+
+          Produce the exact CLI command(s) to run. Verify:
+          1. The CLI args match the options supported by run_recurrent_qat_sweep.py run
+          2. The number of configs × ~10 min/config fits within a reasonable time window
+          3. All env var names are valid (check against Hyperparameters class)
+
+          Output:
+          - sweep_name: <name>
+          - command: <exact CLI command>
+          - num_configs: <count>
+          - estimated_wallclock_hours: <estimate>
+        output_key: sweep_config
+
+      - name: execute
+        type: agent
+        agent: sweep-runner
+        description: |
+          Launch the configured sweep and monitor it to completion. Detect and
+          handle failures early.
+        prompt: |
+          Launch and monitor the sweep:
+
+          Sweep name: {{ sweep_config.sweep_name }}
+          Command: {{ sweep_config.command }}
+
+          Execute the sweep. Monitor progress by tailing logs/ — report status every
+          few configs. Watch for:
+          - OOM errors: escalate to foundation:bug-hunter if encountered
+          - NaN losses: mark that config as failed, continue others
+          - Wallclock overrun: expected — confirm MAX_WALLCLOCK_SECONDS is set
+
+          Report when the sweep completes:
+          - num_completed: <configs that finished cleanly>
+          - num_failed: <configs that crashed>
+          - sweep_name: {{ sweep_config.sweep_name }}
+        output_key: sweep_result
+
+      - name: analyze
+        type: agent
+        agent: result-analyst
+        description: |
+          Parse all logs from the completed sweep, build a ranked leaderboard,
+          and identify the patterns driving the best configurations.
+        prompt: |
+          Analyze the completed sweep: {{ sweep_result.sweep_name }}
+
+          Steps:
+          1. Run: python scripts/run_recurrent_qat_sweep.py summarize --sweep-name {{ sweep_result.sweep_name }}
+          2. Read the TSV leaderboard output
+          3. Rank all configs by final_val_bpb
+          4. Compute per-parameter sensitivity: mean val_bpb per value for each dimension
+          5. Flag any configs with total_submission_size_bytes > 15,900,000 (size risk)
+          6. Identify the top-3 configs and their key distinguishing parameters
+
+          Output:
+          - new_best_bpb: <best final_val_bpb from this sweep>
+          - top_config: <env var overrides for the best config>
+          - key_patterns: <2–3 sentence summary of what drove the best results>
+          - size_risks: <any configs near the 16MB limit>
+        output_key: analysis_result
+
+      - name: evaluate
+        type: agent
+        agent: strategist
+        description: |
+          Compare the sweep's new best against the current best. Determine whether
+          improvement is sufficient to continue or whether the cycle has converged.
+        prompt: |
+          Evaluate the sweep results and determine whether to continue.
+
+          Previous best val_bpb: {{ current_best_bpb }}
+          New best val_bpb from this sweep: {{ analysis_result.new_best_bpb }}
+          Improvement threshold: {{ improvement_threshold }}
+          Iteration: {{ iteration }} of {{ max_iterations }}
+          Analysis: {{ analysis_result.key_patterns }}
+
+          Compute: improvement = {{ current_best_bpb }} - {{ analysis_result.new_best_bpb }}
+
+          Decision logic:
+          - If improvement >= {{ improvement_threshold }}: continue (set converged=false, update current_best_bpb)
+          - If improvement < {{ improvement_threshold }}: set converged=true (below threshold)
+          - If iteration >= max_iterations - 1: set converged=true (iteration limit)
+
+          Output:
+          - improvement: <computed delta>
+          - converged: <true or false>
+          - updated_best_bpb: <the better of current_best_bpb and new_best_bpb>
+          - reasoning: <one sentence explaining the decision>
+        output_key: evaluation_result
+        update_context:
+          converged: "{{ evaluation_result.converged }}"
+          current_best_bpb: "{{ evaluation_result.updated_best_bpb }}"
+          sweep_history: "{% if sweep_history %}{{ sweep_history }},{% endif %}{{ sweep_result.sweep_name }}"
+          iteration: "{{ iteration | int + 1 }}"
+
+  - name: final-report
+    type: agent
+    agent: result-analyst
+    description: |
+      Produce a final summary of the sweep cycle: total iterations, best config
+      found, and recommendation for next steps.
+    prompt: |
+      The sweep cycle has ended after {{ iteration }} iterations.
+
+      Final state:
+      - Best val_bpb achieved: {{ current_best_bpb }}
+      - Converged: {{ converged }}
+      - Sweeps completed: {{ sweep_history }}
+
+      Produce a final sweep cycle summary report:
+      ## Sweep Cycle Summary
+
+      **Iterations completed:** {{ iteration }}
+      **Best val_bpb:** {{ current_best_bpb }}
+      **Termination reason:** <converged below threshold / hit max iterations>
+      **Sweeps run:** {{ sweep_history }}
+
+      ### Best Configuration Found
+      <env var overrides for the overall best config>
+
+      ### Key Findings
+      <2–3 bullet points of what was learned>
+
+      ### Recommended Next Steps
+      <One of: "Submit — beats SOTA", "Run code-optimizer to unlock new knobs",
+       "Escalate to human for strategic pivot", "Continue with full-solve recipe">
+    output_key: cycle_summary

@@ -63,6 +63,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", os.environ.get("NUM_LAYERS", 9)))
+    block_share_strategy = os.environ.get("BLOCK_SHARE_STRATEGY", "cycle")
+    logical_layer_controls = os.environ.get("LOGICAL_LAYER_CONTROLS")
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -86,6 +89,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    qat_enable = bool(int(os.environ.get("QAT_ENABLE", "0")))
+    qat_start_step = int(os.environ.get("QAT_START_STEP", -1))
+    qat_start_fraction = float(os.environ.get("QAT_START_FRACTION", 0.8))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -513,10 +519,15 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.qat_active = False
+
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        weight = fake_quantize_large_weight_ste(self.weight) if self.qat_active else self.weight
+        return F.linear(x, weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -525,6 +536,29 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def fake_quantize_large_weight_ste(weight: Tensor) -> Tensor:
+    if not weight.is_floating_point() or weight.ndim != 2 or weight.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        return weight
+    w32 = weight.float()
+    row_absmax = w32.abs().amax(dim=1, keepdim=True)
+    scale = (row_absmax / 127.0).clamp_min(1.0 / 127.0)
+    quantized = torch.clamp(torch.round(w32 / scale), -127, 127) * scale
+    return weight + (quantized.to(dtype=weight.dtype) - weight).detach()
+
+
+def build_block_indices(num_layers: int, num_unique_blocks: int, strategy: str) -> tuple[int, ...]:
+    if not (1 <= num_unique_blocks <= num_layers):
+        raise ValueError(
+            f"NUM_UNIQUE_BLOCKS must be in [1, NUM_LAYERS], got NUM_UNIQUE_BLOCKS={num_unique_blocks}, "
+            f"NUM_LAYERS={num_layers}"
+        )
+    if strategy == "cycle":
+        return tuple(i % num_unique_blocks for i in range(num_layers))
+    if strategy == "grouped":
+        return tuple(min((i * num_unique_blocks) // num_layers, num_unique_blocks - 1) for i in range(num_layers))
+    raise ValueError(f"Unsupported BLOCK_SHARE_STRATEGY={strategy!r}; expected 'cycle' or 'grouped'")
 
 
 class Rotary(nn.Module):
@@ -642,12 +676,27 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        logical_attn_scale: Tensor | None = None,
+        logical_mlp_scale: Tensor | None = None,
+        logical_resid_mix: Tensor | None = None,
+    ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
+        if logical_resid_mix is not None:
+            mix = mix * logical_resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_scale = self.attn_scale.to(dtype=x.dtype)
+        if logical_attn_scale is not None:
+            attn_scale = attn_scale * logical_attn_scale.to(dtype=x.dtype)
+        mlp_scale = self.mlp_scale.to(dtype=x.dtype)
+        if logical_mlp_scale is not None:
+            mlp_scale = mlp_scale * logical_mlp_scale.to(dtype=x.dtype)
+        x = x + attn_scale[None, None, :] * attn_out
+        x = x + mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -656,6 +705,9 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_unique_blocks: int,
+        block_share_strategy: str,
+        logical_layer_controls: bool,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -672,6 +724,12 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
+        self.num_unique_blocks = num_unique_blocks
+        self.block_share_strategy = block_share_strategy
+        self.logical_layer_controls = logical_layer_controls
+        self.block_indices = build_block_indices(num_layers, num_unique_blocks, block_share_strategy)
+        self.qat_active = False
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -687,9 +745,17 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_unique_blocks)
             ]
         )
+        if logical_layer_controls:
+            self.layer_attn_scale = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            self.layer_mlp_scale = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            self.layer_resid_mix = nn.Parameter(torch.ones(num_layers, 2, model_dim, dtype=torch.float32))
+        else:
+            self.layer_attn_scale = None
+            self.layer_mlp_scale = None
+            self.layer_resid_mix = None
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -703,25 +769,54 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def set_qat_active(self, active: bool) -> None:
+        self.qat_active = active
+        for module in self.modules():
+            if isinstance(module, CastedLinear):
+                module.qat_active = active
+
+    def _logical_controls_for_layer(self, layer_idx: int) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        if not self.logical_layer_controls:
+            return None, None, None
+        if self.layer_attn_scale is None or self.layer_mlp_scale is None or self.layer_resid_mix is None:
+            return None, None, None
+        return (
+            self.layer_attn_scale[layer_idx],
+            self.layer_mlp_scale[layer_idx],
+            self.layer_resid_mix[layer_idx],
+        )
+
+    def _run_layer(self, layer_idx: int, x: Tensor, x0: Tensor) -> Tensor:
+        block = self.blocks[self.block_indices[layer_idx]]
+        logical_attn_scale, logical_mlp_scale, logical_resid_mix = self._logical_controls_for_layer(layer_idx)
+        return block(
+            x,
+            x0,
+            logical_attn_scale=logical_attn_scale,
+            logical_mlp_scale=logical_mlp_scale,
+            logical_resid_mix=logical_resid_mix,
+        )
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        tok_emb_weight = fake_quantize_large_weight_ste(self.tok_emb.weight) if self.qat_active else self.tok_emb.weight
+        x = F.embedding(input_ids, tok_emb_weight)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._run_layer(i, x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._run_layer(self.num_encoder_layers + i, x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, tok_emb_weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -739,6 +834,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    logical_layer_controls = (
+        args.num_unique_blocks < args.num_layers
+        if args.logical_layer_controls is None
+        else bool(int(args.logical_layer_controls))
+    )
     prefer_cuda = bool(int(os.environ.get("PREFER_CUDA", "1")))
     use_cuda = prefer_cuda and torch.cuda.is_available()
     compile_requested = bool(int(os.environ.get("TORCH_COMPILE", "1" if use_cuda else "0")))
@@ -841,6 +941,9 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_blocks=args.num_unique_blocks,
+        block_share_strategy=args.block_share_strategy,
+        logical_layer_controls=logical_layer_controls,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -865,7 +968,12 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    named_params = list(base_model.named_parameters())
+    block_named_params = [
+        (name, p)
+        for name, p in named_params
+        if name not in {"tok_emb.weight", "lm_head.weight"}
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -874,10 +982,8 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -912,6 +1018,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"device:{device.type} torch_compile:{compile_requested}")
+    log0(
+        f"block_sharing:num_layers:{args.num_layers} num_unique_blocks:{args.num_unique_blocks} "
+        f"strategy:{args.block_share_strategy} logical_layer_controls:{logical_layer_controls}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     if use_cuda:
         log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -925,6 +1035,10 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    qat_start_step = args.qat_start_step if args.qat_start_step >= 0 else int(args.iterations * args.qat_start_fraction)
+    log0(
+        f"qat:enabled={args.qat_enable} start_step:{qat_start_step} start_fraction:{args.qat_start_fraction:.3f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -960,6 +1074,7 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        base_model.set_qat_active(False)
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -994,6 +1109,10 @@ def main() -> None:
 
     step = 0
     while True:
+        qat_active = args.qat_enable and step >= qat_start_step
+        if base_model.qat_active != qat_active:
+            base_model.set_qat_active(qat_active)
+            log0(f"qat:active={qat_active} step:{step}")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)

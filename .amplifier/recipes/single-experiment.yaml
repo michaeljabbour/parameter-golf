@@ -1,0 +1,105 @@
+name: single-experiment
+description: |
+  Run one training configuration end-to-end, evaluate metrics, and produce a
+  structured result report. Use this to quickly test a specific hypothesis
+  without the overhead of a full grid sweep.
+
+context:
+  env_vars: ""        # Required: space-separated env var overrides, e.g. "NUM_UNIQUE_BLOCKS=3 BLOCK_SHARE_STRATEGY=cycle QAT_START_FRACTION=0.70"
+  run_id: ""          # Auto-generated if empty (timestamp + config hash)
+  current_best_bpb: "1.2244"  # Comparison baseline for the report
+
+steps:
+  - name: execute
+    type: agent
+    agent: sweep-runner
+    description: |
+      Launch a single training run with the specified env var overrides and
+      monitor it to completion. Report the final val_bpb and artifact size from
+      the training log.
+    prompt: |
+      Run a single training experiment with the following configuration:
+
+      env_vars: {{ env_vars }}
+      run_id: {{ run_id }}
+
+      Steps:
+      1. If run_id is empty, generate one (e.g., single_{{ timestamp }}).
+      2. Launch the training run:
+         ```bash
+         {{ env_vars }} torchrun --nproc_per_node=8 train_gpt.py 2>&1 | tee logs/{{ run_id }}.log
+         ```
+      3. Monitor the log until training completes (look for `final_int8_zlib_roundtrip_exact`
+         or `stopping_early: wallclock_cap`).
+      4. Report: final_val_bpb, total_submission_size_bytes, stop_step, wallclock_ms.
+
+      Output your report as a JSON object so the next step can parse it reliably, e.g.:
+      ```json
+      {
+        "run_id": "<run_id>",
+        "final_val_bpb": 1.2183,
+        "total_submission_size_bytes": 15821034,
+        "stop_step": 4096,
+        "wallclock_ms": 581234
+      }
+      ```
+    output_key: execute_result
+
+  - name: analyze
+    type: agent
+    agent: result-analyst
+    description: |
+      Parse the training log from the completed run and extract all key metrics:
+      final val_bpb (post-quant), best pre-quant val_bpb, artifact size, and
+      whether training was time-constrained.
+    prompt: |
+      Analyze the training log for run: {{ execute_result.run_id }}
+
+      Log file: logs/{{ execute_result.run_id }}.log
+
+      Extract and report:
+      1. final_val_bpb — the post-quantization val BPB (competition metric)
+      2. best_prequant_val_bpb — best val_bpb before QAT started
+      3. total_submission_size_bytes — artifact size (must be < 16,000,000)
+      4. stop_step — what step training stopped at
+      5. wallclock_ms — total training time in milliseconds
+      6. final_int8_zlib_roundtrip_exact — true/false (must be true for valid submission)
+      7. Whether training was time-constrained (hit MAX_WALLCLOCK_SECONDS)
+
+      Use the regex patterns in experiment-tracking.md for precise extraction.
+    output_key: analysis_result
+
+  - name: report
+    type: agent
+    agent: result-analyst
+    description: |
+      Produce a final structured report comparing this run's results to the
+      current best, with a clear recommendation.
+    prompt: |
+      Produce a final report for the single-experiment run.
+
+      Run configuration: {{ env_vars }}
+      Analysis results: {{ analysis_result }}
+      Current best val_bpb: {{ current_best_bpb }}
+
+      Report format:
+      ## Single Experiment Result
+
+      **Run ID:** <run_id>
+      **Configuration:** <env_vars>
+
+      ### Metrics
+      | Metric | Value | Status |
+      |---|---|---|
+      | final_val_bpb | <value> | ✓ Beat baseline / ✗ Worse than baseline |
+      | artifact_size | <bytes> | ✓ Under 16MB / ✗ Over limit |
+      | wallclock | <seconds> | ✓ Under 10min / ✗ Over limit |
+      | roundtrip_exact | <true/false> | ✓ / ✗ |
+
+      ### Delta vs. Current Best
+      <val_bpb delta — positive means improvement>
+
+      ### Recommendation
+      <One of: "Submit candidate — beats SOTA by Δ", "Continue sweeping — promising direction",
+       "Deprioritize — underperforms baseline", "Invalid — constraint violation">
+    output_key: final_report

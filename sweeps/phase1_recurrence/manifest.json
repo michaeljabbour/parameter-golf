@@ -1,0 +1,34 @@
+{
+  "sweep_id": "phase1_recurrence",
+  "created_at_unix": 1773927471.3088436,
+  "grid": {
+    "num_unique_blocks": [
+      2,
+      3,
+      4
+    ],
+    "block_share_strategy": [
+      "cycle",
+      "grouped"
+    ],
+    "qat_start_fraction": [
+      0.0
+    ]
+  },
+  "base_args": {
+    "nproc_per_node": 1,
+    "num_layers": 9,
+    "model_dim": 512,
+    "num_heads": 8,
+    "num_kv_heads": 4,
+    "mlp_mult": 2,
+    "train_batch_tokens": 65536,
+    "train_seq_len": 1024,
+    "iterations": 2000,
+    "max_wallclock_seconds": 3600.0,
+    "torch_compile": false
+  },
+  "extra_env": {
+    "QAT_ENABLE": "0"
+  }
+}

@@ -326,7 +326,14 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     if p
 )
 FP16_KEEP_NAME_PATTERNS = tuple(  # tok_emb kept fp16 for ~0.006 BPB improvement vs INT8
-    p for p in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",") if p
+    # blocks.8.attn.c_k kept fp16: this tensor has large outlier rows that cause int6
+    # max-based scaling (scale = row_max/31) to destroy precision for all other values
+    # in those rows, producing catastrophic BPB degradation (~0.475) on roundtrip.
+    p
+    for p in os.environ.get(
+        "FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k"
+    ).split(",")
+    if p
 )
 INT8_CLIP_Q = 99.99984 / 100.0
 
